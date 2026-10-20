@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+# test-slot: run a command once one of N machine-wide test slots is free.
+# Usage: test-slot <command...>   (TEST_SLOTS=2 by default)
+slots=${TEST_SLOTS:-2}
+dir=${XDG_RUNTIME_DIR:-/tmp}/test-slots
+mkdir -p "$dir"
+while :; do
+  for i in $(seq 1 "$slots"); do
+    exec 9>"$dir/$i.lock"
+    if flock -n 9; then exec "$@"; fi
+  done
+  sleep 2
+done

@@ -1,0 +1,232 @@
+#!/usr/bin/env bash
+# wtree: one git worktree per task, cheap to create and safe to remove.
+#
+#   wtree new <name> [base]    create <repo>-wt/<name> on a new branch <name> from base
+#                              (default: origin/HEAD, else the main checkout's branch),
+#                              copy the files listed in .worktreeinclude, then run deps
+#   wtree deps [name]          link node_modules when the lockfile matches the main
+#                              checkout's, otherwise install in the worktree
+#   wtree port [name]          print the worktree's port (stable across restarts)
+#   wtree run [name] -- <cmd>  re-check deps, then run cmd in the worktree with PORT set,
+#                              holding a git worktree lock while it runs
+#   wtree rm <name>            remove a clean, unlocked, idle worktree; delete its branch
+#                              only if git considers it merged
+#   wtree gc [--apply]         list worktrees whose branch is merged or gone upstream, with
+#                              their size; --apply removes the ones that are clean and idle
+#   wtree ls                   git worktree list
+#
+# With no name, deps/port/run act on the worktree you are in.
+# Settings: WTREE_ROOT (default <main checkout>-wt), WTREE_PORT_BASE (3100),
+#   WTREE_PORT_SPAN (900), WTREE_INSTALL (install command; default from the lockfile type).
+# Needs bash 4+, git 2.17+, Linux (/proc is used to find processes inside a worktree).
+set -euo pipefail
+
+die() { echo "wtree: $*" >&2; exit 1; }
+say() { echo "wtree: $*"; }
+
+MAIN=$(git worktree list --porcelain 2>/dev/null | sed -n '1s/^worktree //p') || true
+[ -n "$MAIN" ] || die "not inside a git repository"
+ROOT=${WTREE_ROOT:-$MAIN-wt}
+
+path_of() { if [ -n "${1:-}" ]; then echo "$ROOT/$1"; else git rev-parse --show-toplevel; fi; }
+
+base_ref() {
+  git -C "$MAIN" symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null ||
+    git -C "$MAIN" rev-parse --abbrev-ref HEAD
+}
+
+lockfile() {
+  local f
+  for f in pnpm-lock.yaml package-lock.json yarn.lock bun.lock; do
+    if [ -f "$1/$f" ]; then echo "$f"; return; fi
+  done
+}
+
+install_cmd() {
+  case $1 in
+    pnpm-lock.yaml) echo "pnpm install --frozen-lockfile --prefer-offline" ;;
+    package-lock.json) echo "npm ci --prefer-offline --no-audit --no-fund" ;;
+    yarn.lock) echo "yarn install --immutable" ;;
+    bun.lock) echo "bun install --frozen-lockfile" ;;
+  esac
+}
+
+lock_reason() {  # prints the lock line's reason ("" when unlocked, "locked" when no reason)
+  git -C "$MAIN" worktree list --porcelain | awk -v wt="worktree $1" '
+    $0 == wt { f = 1; next }  /^worktree / { f = 0 }
+    f && /^locked/ { r = $0; sub(/^locked ?/, "", r); print (r == "" ? "locked" : r); exit }'
+}
+
+live_lock() {  # the lock reason, unless the lock names a pid that is no longer running
+  local reason pid
+  reason=$(lock_reason "$1")
+  [ -n "$reason" ] || return 0
+  pid=$(sed -n 's/.*pid \([0-9][0-9]*\).*/\1/p' <<< "$reason")
+  if [ -n "$pid" ] && ! kill -0 "$pid" 2> /dev/null; then return 0; fi
+  echo "$reason"
+}
+
+CWDS=""
+busy() {  # processes whose working directory is inside $1; /proc is scanned once per run
+  local p c
+  if [ -z "$CWDS" ]; then
+    for p in /proc/[0-9]*; do
+      c=$(readlink "$p/cwd" 2>/dev/null) || continue
+      CWDS+="${p#/proc/} $c"$'\n'
+    done
+  fi
+  while read -r p c; do
+    case "$c/" in "$1"/*) echo "  pid $p: $(tr '\0' ' ' < "/proc/$p/cmdline" 2>/dev/null | cut -c1-60)" ;; esac
+  done <<< "$CWDS"
+}
+
+include() {  # copy gitignored files matching .worktreeinclude (simple globs from the repo root)
+  local wt=$1 pat f
+  [ -f "$MAIN/.worktreeinclude" ] || return 0
+  while IFS= read -r pat || [ -n "$pat" ]; do
+    case "$pat" in '' | '#'*) continue ;; esac
+    while IFS= read -r f; do
+      [ -n "$f" ] || continue
+      git -C "$MAIN" check-ignore -q "$f" || continue
+      mkdir -p "$wt/$(dirname "$f")"
+      cp -pR "$MAIN/$f" "$wt/$f"
+      say "copied $f"
+    done < <(cd "$MAIN" && compgen -G "$pat" || true)
+  done < "$MAIN/.worktreeinclude"
+}
+
+deps() {
+  local wt lf sum mark
+  wt=$(path_of "${1:-}")
+  [ "$wt" != "$MAIN" ] || die "deps runs in a worktree, not in the main checkout"
+  [ -f "$wt/package.json" ] || return 0
+  lf=$(lockfile "$wt")
+  [ -n "$lf" ] || die "no lockfile in $wt"
+  sum=$(cksum < "$wt/$lf")
+  if [ -L "$wt/node_modules" ]; then
+    if cmp -s "$wt/$lf" "$MAIN/$lf"; then return 0; fi
+    rm "$wt/node_modules"  # the link only: no trailing slash, never install through it
+  elif [ -d "$wt/node_modules" ]; then
+    mark=$(cat "$wt/node_modules/.wtree-lock" 2> /dev/null || true)
+    if [ "$mark" = "$sum" ]; then return 0; fi
+    # Made by other tooling (no mark) for the same lockfile as the main checkout: keep it.
+    if [ -z "$mark" ] && cmp -s "$wt/$lf" "$MAIN/$lf"; then return 0; fi
+  elif [ -d "$MAIN/node_modules" ] && cmp -s "$wt/$lf" "$MAIN/$lf"; then
+    ln -s "$MAIN/node_modules" "$wt/node_modules"
+    say "linked node_modules to the main checkout (same $lf)"
+    return 0
+  fi
+  say "$lf differs from the main checkout's: installing in the worktree"
+  (cd "$wt" && eval "${WTREE_INSTALL:-$(install_cmd "$lf")}")
+  echo "$sum" > "$wt/node_modules/.wtree-lock"
+}
+
+port() {
+  local name n
+  name=$(basename "$(path_of "${1:-}")")
+  if [[ $name =~ ^[0-9]+$ ]]; then n=$((10#$name)); else n=$(printf %s "$name" | cksum | cut -d' ' -f1); fi
+  echo $(( ${WTREE_PORT_BASE:-3100} + n % ${WTREE_PORT_SPAN:-900} ))
+}
+
+run() {
+  local name="" wt p reason locked=no
+  if [ "${1:-}" != "--" ]; then name=${1:-}; shift || true; fi
+  [ "${1:-}" = "--" ] && shift
+  [ $# -gt 0 ] || die "usage: wtree run [name] -- <command>"
+  wt=$(path_of "$name")
+  [ "$wt" != "$MAIN" ] || die "run it in a worktree, not in the main checkout"
+  deps "$name"
+  p=$(port "$name")
+  if (exec 3<> "/dev/tcp/127.0.0.1/$p") 2>/dev/null; then die "port $p is already in use"; fi
+  reason=$(lock_reason "$wt")
+  if [ -z "$reason" ]; then
+    git -C "$MAIN" worktree lock --reason "wtree run pid $$" "$wt"
+    locked=yes
+    trap 'git -C "$MAIN" worktree unlock "$wt" 2>/dev/null || true' EXIT
+  fi
+  say "$wt on port $p"
+  local rc=0
+  (cd "$wt" && PORT=$p WTREE_NAME=$(basename "$wt") "$@") || rc=$?
+  [ $locked = no ] || { git -C "$MAIN" worktree unlock "$wt" 2>/dev/null || true; trap - EXIT; }
+  return $rc
+}
+
+rm_wt() {
+  local name=${1:-} wt reason procs branch
+  [ -n "$name" ] || die "usage: wtree rm <name>"
+  wt="$ROOT/$name"
+  [ -d "$wt" ] || die "no worktree at $wt"
+  reason=$(lock_reason "$wt")
+  if [ -n "$reason" ]; then
+    [ -z "$(live_lock "$wt")" ] || die "$name is locked: $reason"
+    git -C "$MAIN" worktree unlock "$wt"
+    say "lifted a stale lock ($reason)"
+  fi
+  procs=$(busy "$wt")
+  [ -z "$procs" ] || die "processes are running in $wt:"$'\n'"$procs"
+  branch=$(git -C "$wt" symbolic-ref --quiet --short HEAD || true)
+  # Never --force: git refuses uncommitted or untracked work, and deletes ignored files
+  # (node_modules, .env); a symlinked node_modules is unlinked, not followed.
+  git -C "$MAIN" worktree remove "$wt" || die "$name not removed"
+  say "removed $wt"
+  if [ -n "$branch" ]; then
+    if git -C "$MAIN" branch -d "$branch" > /dev/null 2>&1; then say "deleted merged branch $branch"
+    else say "kept branch $branch (git does not see it as merged; delete it by hand if it was)"; fi
+  fi
+}
+
+gc() {
+  local apply=${1:-} base wt br state why size
+  git -C "$MAIN" fetch --prune --quiet 2> /dev/null || say "fetch failed; using local refs"
+  base=$(base_ref)
+  while read -r wt; do
+    case "$wt" in "$ROOT"/*) ;; *) continue ;; esac
+    [ -d "$wt" ] || continue
+    br=$(git -C "$wt" symbolic-ref --quiet --short HEAD || true)
+    state="" why=""
+    if [ -n "$br" ] && git -C "$MAIN" merge-base --is-ancestor "$br" "$base" 2> /dev/null; then state="merged"
+    elif [ -n "$br" ] && [ "$(git -C "$MAIN" for-each-ref --format='%(upstream:track)' "refs/heads/$br")" = "[gone]" ]; then state="upstream gone"
+    else why="unmerged"; fi
+    [ -z "$(git -C "$wt" status --porcelain)" ] || why="${why:+$why, }uncommitted work"
+    [ -z "$(live_lock "$wt")" ] || why="${why:+$why, }locked"
+    [ -z "$(busy "$wt")" ] || why="${why:+$why, }processes running"
+    size=$(du -sh "$wt" 2> /dev/null | cut -f1)
+    if [ -z "$why" ]; then
+      printf 'remove  %6s  %s  (%s)\n' "$size" "${wt#"$ROOT"/}" "$state"
+      if [ "$apply" = "--apply" ]; then (rm_wt "${wt#"$ROOT"/}") || true; fi
+    else
+      printf 'keep    %6s  %s  (%s)\n' "$size" "${wt#"$ROOT"/}" "$why"
+    fi
+  done < <(git -C "$MAIN" worktree list --porcelain | sed -n 's/^worktree //p')
+}
+
+new() {
+  local name=${1:-} base wt
+  [ -n "$name" ] || die "usage: wtree new <name> [base]"
+  wt="$ROOT/$name"
+  [ ! -e "$wt" ] || die "$wt already exists"
+  git -C "$MAIN" fetch --quiet 2> /dev/null || true
+  base=${2:-$(base_ref)}
+  mkdir -p "$ROOT"
+  if git -C "$MAIN" show-ref --verify --quiet "refs/heads/$name"; then
+    git -C "$MAIN" worktree add --quiet "$wt" "$name"
+  else
+    git -C "$MAIN" worktree add --quiet --no-track -b "$name" "$wt" "$base"
+  fi
+  include "$wt"
+  deps "$name"
+  say "ready: cd $wt   (port $(port "$name"))"
+}
+
+cmd=${1:-}
+shift || true
+case "$cmd" in
+  new) new "$@" ;;
+  deps) deps "$@" ;;
+  port) port "$@" ;;
+  run) run "$@" ;;
+  rm) rm_wt "$@" ;;
+  gc) gc "$@" ;;
+  ls) git -C "$MAIN" worktree list ;;
+  *) sed -n '2,/^set -euo/p' "$0" | sed '$d; s/^# \{0,1\}//'; exit 2 ;;
+esac

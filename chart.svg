@@ -1,0 +1,30 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 620 230" width="620" height="230" role="img" aria-label="Full-suite wall time before and after">
+  <rect width="620" height="230" rx="8" fill="#ffffff"/>
+  <text x="20" y="28" font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="15" font-weight="600" fill="#18222c">Full-suite wall time, same machine, back to back</text>
+  <g stroke="#c9d3d8" stroke-width="1">
+    <line x1="160" y1="42" x2="160" y2="198"/>
+    <line x1="247.9" y1="42" x2="247.9" y2="198" stroke-dasharray="2 4"/>
+    <line x1="335.7" y1="42" x2="335.7" y2="198" stroke-dasharray="2 4"/>
+    <line x1="423.6" y1="42" x2="423.6" y2="198" stroke-dasharray="2 4"/>
+    <line x1="511.4" y1="42" x2="511.4" y2="198" stroke-dasharray="2 4"/>
+  </g>
+  <g font-family="system-ui, -apple-system, Segoe UI, sans-serif" font-size="13" fill="#18222c" text-anchor="end">
+    <text x="150" y="65">Before, run 1</text>
+    <text x="150" y="103">Before, run 2</text>
+    <text x="150" y="141">After, first run</text>
+    <text x="150" y="179">After, warm cache</text>
+  </g>
+  <rect x="160" y="50" width="402.4" height="22" rx="2" fill="#8a97a1"/>
+  <rect x="160" y="88" width="363.2" height="22" rx="2" fill="#8a97a1"/>
+  <rect x="160" y="126" width="273.6" height="22" rx="2" fill="#0b6a86" fill-opacity="0.6"/>
+  <rect x="160" y="164" width="223.5" height="22" rx="2" fill="#0b6a86"/>
+  <g font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12" font-weight="600" fill="#18222c">
+    <text x="568" y="65">1,374 s</text>
+    <text x="529" y="103">1,240 s</text>
+    <text x="439" y="141">934 s</text>
+    <text x="389" y="179">763 s</text>
+  </g>
+  <g font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="11" fill="#55636f" text-anchor="middle">
+    <text x="160" y="218">0</text><text x="247.9" y="218">300</text><text x="335.7" y="218">600</text><text x="423.6" y="218">900</text><text x="511.4" y="218">1,200 s</text>
+  </g>
+</svg>
