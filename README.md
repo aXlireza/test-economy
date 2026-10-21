@@ -8,7 +8,7 @@
 
 - This guide.
 - [`test-slot`](test-slot): runs a command once one of N machine-wide test slots is free (`TEST_SLOTS`, default 2), so no more than N test runs go at once across all your projects.
-- [`wtree`](wtree): one git worktree per task. It links or installs dependencies by lockfile, gives each worktree a stable port, locks a worktree while something runs in it, removes it safely, and cleans up merged ones.
+- [`wtree`](wtree): one git worktree per task. It links or installs dependencies by lockfile (a workspace repo always installs), gives each worktree a stable port, locks a worktree while something runs in it, removes it safely, and cleans up merged ones.
 
 To use the scripts, copy them onto your `PATH`:
 
@@ -189,8 +189,9 @@ Removing 96 worktrees of merged work took the folder from 14 GB to under 5 GB.
 
 | Situation | Do |
 |---|---|
-| The worktree's lockfile is identical to the main checkout's | Symlink `node_modules` to the main checkout's. It costs nothing. |
+| The worktree's lockfile is identical to the main checkout's, in a single-package repository | Symlink `node_modules` to the main checkout's. It costs nothing. |
 | The lockfile differs (the branch adds or upgrades a package) | Install inside the worktree. With npm that is a full copy, deleted with the worktree. |
+| The repository is a workspace (`packages:` in `pnpm-workspace.yaml`, or `workspaces` in `package.json`) | Always install inside the worktree, even when the lockfiles match. The package manager links workspace packages with relative symlinks (`node_modules/@app/db -> ../../packages/db`), so through a linked `node_modules` they resolve into the main checkout's sources, and each package's own `node_modules` is not covered. We reproduced it: through the link, the worktree loaded the main checkout's package. |
 | A bundler refuses a symlinked `node_modules` | Next.js 16.4 added `experimental.turbopackAdditionalRoots`, which follows symlinks outside the project ([docs](https://nextjs.org/docs/app/api-reference/config/next-config-js/turbopack)). On older versions, make a copy just before the build and remove it afterwards. |
 
 - **Check at every use, not only at creation.** The main checkout moves on. A linked worktree then silently runs newer packages than its own branch declares.
@@ -251,18 +252,19 @@ A branch can be checked out in only one worktree at a time.
 | [Conductor](https://www.conductor.build/docs/core/scripts) | Setup, run and archive scripts per workspace, and ten ports each |
 | [Claude Code `--worktree`](https://code.claude.com/docs/en/worktrees) | Reads `.worktreeinclude`, locks while an agent runs, removes clean worktrees, `WorktreeCreate`/`WorktreeRemove` hooks |
 
-**A reference script.** [`wtree`](wtree), about 230 lines of bash in this repository, applies these rules to an npm, pnpm, Yarn or Bun project:
+**A reference script.** [`wtree`](wtree), about 240 lines of bash in this repository, applies these rules to an npm, pnpm, Yarn or Bun project:
 
 ```text
 wtree new <name> [base]    sibling worktree + branch, copy .worktreeinclude files, deps
-wtree deps [name]          link node_modules if the lockfile matches the main checkout, else install
+wtree deps [name]          link node_modules if the lockfile matches the main checkout, else install;
+                           a workspace repo always installs
 wtree port [name]          the worktree's stable port
 wtree run [name] -- cmd    re-check deps, run cmd with PORT set, locked while it runs
 wtree rm <name>            refuse if dirty, locked or busy; never --force; delete the branch only if merged
 wtree gc [--apply]         list (or remove) merged or upstream-gone worktrees with their size
 ```
 
-Every path in it was exercised against a scratch repository: linking and installing, the lock, refusing dirty, locked and busy worktrees, lifting a stale lock, and squash-merge detection. It reads `.worktreeinclude` as plain globs from the repository root, not full gitignore syntax, so negations such as `!.env.example` are not supported.
+Every path in it was exercised against a scratch repository: linking and installing, installing in pnpm and npm workspaces, the lock, refusing dirty, locked and busy worktrees, lifting a stale lock, and squash-merge detection. It reads `.worktreeinclude` as plain globs from the repository root, not full gitignore syntax, so negations such as `!.env.example` are not supported.
 
 ## 6. Measure every change honestly
 

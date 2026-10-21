@@ -5,7 +5,8 @@
 #                              (default: origin/HEAD, else the main checkout's branch),
 #                              copy the files listed in .worktreeinclude, then run deps
 #   wtree deps [name]          link node_modules when the lockfile matches the main
-#                              checkout's, otherwise install in the worktree
+#                              checkout's, otherwise install in the worktree; a workspace
+#                              repo (pnpm, npm, Yarn or Bun workspaces) always installs
 #   wtree port [name]          print the worktree's port (stable across restarts)
 #   wtree run [name] -- <cmd>  re-check deps, then run cmd in the worktree with PORT set,
 #                              holding a git worktree lock while it runs
@@ -95,28 +96,38 @@ include() {  # copy gitignored files matching .worktreeinclude (simple globs fro
   done < "$MAIN/.worktreeinclude"
 }
 
+workspace() {  # true when the repo links its own packages into node_modules
+  # The package manager links workspace packages with relative symlinks
+  # (node_modules/@scope/db -> ../../packages/db), so through a linked node_modules they
+  # resolve into the main checkout's sources, and per-package node_modules are not covered.
+  if [ -f "$1/pnpm-workspace.yaml" ] && grep -q '^packages:' "$1/pnpm-workspace.yaml"; then return 0; fi
+  grep -q '"workspaces"' "$1/package.json" 2> /dev/null
+}
+
 deps() {
-  local wt lf sum mark
+  local wt lf sum mark ws=no
   wt=$(path_of "${1:-}")
   [ "$wt" != "$MAIN" ] || die "deps runs in a worktree, not in the main checkout"
   [ -f "$wt/package.json" ] || return 0
   lf=$(lockfile "$wt")
   [ -n "$lf" ] || die "no lockfile in $wt"
   sum=$(cksum < "$wt/$lf")
+  if workspace "$wt"; then ws=yes; fi
   if [ -L "$wt/node_modules" ]; then
-    if cmp -s "$wt/$lf" "$MAIN/$lf"; then return 0; fi
+    if [ $ws = no ] && cmp -s "$wt/$lf" "$MAIN/$lf"; then return 0; fi
     rm "$wt/node_modules"  # the link only: no trailing slash, never install through it
   elif [ -d "$wt/node_modules" ]; then
     mark=$(cat "$wt/node_modules/.wtree-lock" 2> /dev/null || true)
     if [ "$mark" = "$sum" ]; then return 0; fi
     # Made by other tooling (no mark) for the same lockfile as the main checkout: keep it.
     if [ -z "$mark" ] && cmp -s "$wt/$lf" "$MAIN/$lf"; then return 0; fi
-  elif [ -d "$MAIN/node_modules" ] && cmp -s "$wt/$lf" "$MAIN/$lf"; then
+  elif [ $ws = no ] && [ -d "$MAIN/node_modules" ] && cmp -s "$wt/$lf" "$MAIN/$lf"; then
     ln -s "$MAIN/node_modules" "$wt/node_modules"
     say "linked node_modules to the main checkout (same $lf)"
     return 0
   fi
-  say "$lf differs from the main checkout's: installing in the worktree"
+  if [ $ws = yes ]; then say "workspace repo: installing in the worktree (never linked)"
+  else say "$lf differs from the main checkout's: installing in the worktree"; fi
   (cd "$wt" && eval "${WTREE_INSTALL:-$(install_cmd "$lf")}")
   echo "$sum" > "$wt/node_modules/.wtree-lock"
 }
